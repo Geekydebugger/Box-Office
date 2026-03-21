@@ -79,7 +79,7 @@ Opens a browser at http://localhost:8501
 
 ## 🔮 How Predictions Work
 
-**Features used:**
+**Features us
 - Budget (₹ Crore)
 - Opening Day collection (₹ Crore)
 - Number of screens
