@@ -1,10 +1,11 @@
 # ================================================================
-#   INDIAN BOX OFFICE PREDICTOR — main.py  (v4)
+#   INDIAN BOX OFFICE PREDICTOR — main.py  (v5 + SMOTE)
 #   ✦ Quick wins  : Rating, Log_Budget, Budget_Squared, Overseas_Ratio
 #   ✦ Confidence  : Quantile regression → prediction range
 #   ✦ Two-stage   : Stage-1 predicts opening weekend,
 #                   Stage-2 uses it to predict lifetime
 #   ✦ 12-algo benchmark + auto stacking ensemble
+#   ✦ SMOTE class balancing for classifier training
 #   ✦ SQLite logging
 # ================================================================
 
@@ -15,9 +16,25 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from difflib import get_close_matches
 from collections import Counter
+from sklearn.calibration import CalibratedClassifierCV
 
 warnings.filterwarnings("ignore")
 sns.set_style("whitegrid")
+
+# ── Install imbalanced-learn if missing ──────────────────────
+try:
+    from imblearn.over_sampling import SMOTE, SVMSMOTE
+    from imblearn.pipeline import Pipeline as ImbPipeline
+    HAS_IMBLEARN = True
+    print("  ✓ imbalanced-learn detected")
+except ImportError:
+    import subprocess, sys
+    print("  Installing imbalanced-learn...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install",
+                           "imbalanced-learn", "--quiet"])
+    from imblearn.over_sampling import SMOTE, SVMSMOTE
+    HAS_IMBLEARN = True
+    print("  ✓ imbalanced-learn installed")
 
 from sklearn.model_selection  import train_test_split, KFold, cross_val_score, StratifiedKFold
 from sklearn.preprocessing    import LabelEncoder, StandardScaler
@@ -35,6 +52,8 @@ from sklearn.svm              import SVR, SVC
 from sklearn.neighbors        import KNeighborsRegressor, KNeighborsClassifier
 from sklearn.naive_bayes      import GaussianNB
 from xgboost                  import XGBRegressor, XGBClassifier
+from scipy.stats              import randint, uniform
+from sklearn.model_selection  import RandomizedSearchCV
 
 try:
     from lightgbm import LGBMRegressor, LGBMClassifier
@@ -129,15 +148,15 @@ COLUMN_MAP = {
     "rating":"Rating","genre":"Genre",
 }
 VERDICT_MAP = {
-    "all time blockbuster":"BLOCKBUSTER",   # merged into BLOCKBUSTER
+    "all time blockbuster":"BLOCKBUSTER",
     "blockbuster":         "BLOCKBUSTER",
     "super hit":           "SUPER HIT",
     "above average":       "HIT",
     "hit":                 "HIT",
     "average":             "AVERAGE",
-    "below average":       "FLOP",          # merged into FLOP
+    "below average":       "FLOP",
     "flop":                "FLOP",
-    "disaster":            "FLOP",          # merged into FLOP
+    "disaster":            "FLOP",
 }
 GENRE_LIST = ["Action","Adventure","Biography","Comedy","Crime","Drama",
               "Family","Fantasy","Historical","Horror","Musical","Mystery",
@@ -163,12 +182,95 @@ def load_csv(path):
     return df.rename(columns=rename)
 
 # ================================================================
+#  SMOTE BALANCING UTILITY
+# ================================================================
+def apply_smote(X_train, y_train, strategy="auto", random_state=42):
+    """
+    Apply SMOTE to balance classifier training data.
+    Falls back to SVMSMOTE if a class has too few samples,
+    and uses RandomOverSampler as last resort.
+
+    Parameters
+    ----------
+    X_train     : array-like of shape (n_samples, n_features)
+    y_train     : array-like of shape (n_samples,)
+    strategy    : sampling_strategy passed to SMOTE
+    random_state: reproducibility seed
+
+    Returns
+    -------
+    X_resampled, y_resampled, smote_report (dict)
+    """
+    from collections import Counter
+    before = Counter(y_train.tolist() if hasattr(y_train, "tolist") else list(y_train))
+
+    # SMOTE needs at least k_neighbors + 1 samples per minority class
+    # Use k_neighbors = min(5, min_class_count - 1)  to be safe
+    min_count = min(before.values())
+    k_neighbors = max(1, min(5, min_count - 1))
+
+    try:
+        smote = SMOTE(
+            sampling_strategy=strategy,
+            k_neighbors=k_neighbors,
+            random_state=random_state,
+            n_jobs=-1
+        )
+        X_res, y_res = smote.fit_resample(X_train, y_train)
+        method_used = f"SMOTE (k={k_neighbors})"
+    except Exception as e1:
+        print(f"    SMOTE failed ({e1}), trying SVMSMOTE...")
+        try:
+            smote = SVMSMOTE(
+                sampling_strategy=strategy,
+                k_neighbors=k_neighbors,
+                random_state=random_state,
+                n_jobs=-1
+            )
+            X_res, y_res = smote.fit_resample(X_train, y_train)
+            method_used = f"SVMSMOTE (k={k_neighbors})"
+        except Exception as e2:
+            print(f"    SVMSMOTE failed ({e2}), using RandomOverSampler...")
+            from imblearn.over_sampling import RandomOverSampler
+            ros = RandomOverSampler(sampling_strategy=strategy, random_state=random_state)
+            X_res, y_res = ros.fit_resample(X_train, y_train)
+            method_used = "RandomOverSampler"
+
+    after = Counter(y_res.tolist() if hasattr(y_res, "tolist") else list(y_res))
+    report = {
+        "method": method_used,
+        "before": dict(before),
+        "after":  dict(after),
+        "added":  len(y_res) - len(y_train),
+    }
+    return X_res, y_res, report
+
+
+def print_smote_report(report, label_encoder):
+    """Pretty-print the SMOTE balancing report with class names."""
+    print(f"\n  ── SMOTE BALANCING REPORT ──")
+    print(f"  Method used : {report['method']}")
+    print(f"  Samples added: {report['added']}")
+    print(f"\n  {'Class':<18} {'Before':>8}  {'After':>8}  {'Δ':>8}")
+    print("  " + "-"*48)
+    for cls_id in sorted(report['before'].keys()):
+        cls_name = label_encoder.inverse_transform([cls_id])[0]
+        b = report['before'].get(cls_id, 0)
+        a = report['after'].get(cls_id, 0)
+        print(f"  {cls_name:<18} {b:>8}  {a:>8}  {a-b:>+8}")
+    print(f"  {'TOTAL':<18} {sum(report['before'].values()):>8}  "
+          f"{sum(report['after'].values()):>8}  "
+          f"{report['added']:>+8}")
+
+
+# ================================================================
 #  MAIN
 # ================================================================
 print("\n" + "="*65)
-print("  INDIAN BOX OFFICE PREDICTOR  v4")
+print("  INDIAN BOX OFFICE PREDICTOR  v5  (+SMOTE)")
 print("  ✦ Rating + Log features  ✦ Confidence Intervals")
 print("  ✦ Two-Stage Prediction   ✦ 12-Algo Benchmark")
+print("  ✦ SMOTE Class Balancing  ✦ SQLite Logging")
 print("="*65)
 
 print("\n[0/10] Initialising database...")
@@ -215,7 +317,6 @@ df["Opening_Day"] = df["Opening_Day"].fillna(df["Opening_Day"].median())
 df["Screens"]     = df["Screens"].fillna(df["Screens"].median())
 df["India_Gross"] = df["India_Gross"].fillna(df["India_Gross"].median())
 df["Overseas"]    = df["Overseas"].fillna(df["Overseas"].median())
-# Rating: fill missing with median (many regional films don't have ratings)
 rating_median     = df["Rating"].median()
 df["Rating"]      = df["Rating"].fillna(rating_median)
 df.replace([np.inf,-np.inf], 0, inplace=True)
@@ -236,21 +337,18 @@ df["Log_Worldwide"]     = np.log1p(df["Worldwide"])
 df["Profit"]            = df["Worldwide"] - df["Budget"]
 df["Profit_Percentage"] = (df["Profit"] / df["Budget"]) * 100
 
-# ── QUICK WIN FEATURES ────────────────────────────────────────
-df["Log_Budget"]        = np.log1p(df["Budget"])          # captures scale non-linearly
-df["Budget_Squared"]    = df["Budget"] ** 2               # blockbuster scale effect
+df["Log_Budget"]        = np.log1p(df["Budget"])
+df["Budget_Squared"]    = df["Budget"] ** 2
 df["Overseas_Ratio"]    = df["Overseas"] / df["Worldwide"].replace(0, np.nan)
 df["Overseas_Ratio"]    = df["Overseas_Ratio"].fillna(0).clip(0, 1)
-df["Rating_x_Budget"]  = df["Rating"] * df["Budget"]     # interaction: quality × scale
+df["Rating_x_Budget"]  = df["Rating"] * df["Budget"]
 
-# Ratio features
 df["Opening_to_Budget"] = df["Opening_Day"] / df["Budget"]
 df["Screens_to_Budget"] = df["Screens"] / df["Budget"]
 df["Opening_per_Screen"]= df["Opening_Day"] / df["Screens"].replace(0, np.nan)
 df.replace([np.inf,-np.inf], 0, inplace=True)
 df["Opening_per_Screen"] = df["Opening_per_Screen"].fillna(0)
 
-# Date features
 df["Released_Date"] = pd.to_datetime(df["Released_Date"], dayfirst=True, errors="coerce")
 df["Release_Month"] = df["Released_Date"].dt.month.fillna(6).astype(int)
 df["Release_Year"]  = df["Released_Date"].dt.year.fillna(2022).astype(int)
@@ -259,16 +357,15 @@ df["Franchise"]     = df["Movie_Name"].astype(str).str.contains(
     r"\b(2|3|4|II|III|IV|Part|Chapter|Return|Reloaded|Revolution|Legacy)\b",
     case=False, regex=True).astype(int)
 
-# Festival flag
 def festival_flag(row):
     m, d = row["Release_Month"], (row["Released_Date"].day
                                    if pd.notna(row["Released_Date"]) else 15)
-    if m == 4 and d <= 25: return 1   # Eid (approx)
-    if m == 5 and d <= 15: return 1   # Eid (approx)
-    if m == 10 and d >= 20: return 1  # Diwali (approx)
-    if m == 11 and d <= 10: return 1  # Diwali (approx)
-    if m == 12 and d >= 20: return 1  # Christmas
-    if m == 8 and 13 <= d <= 17: return 1  # Independence Day
+    if m == 4 and d <= 25: return 1
+    if m == 5 and d <= 15: return 1
+    if m == 10 and d >= 20: return 1
+    if m == 11 and d <= 10: return 1
+    if m == 12 and d >= 20: return 1
+    if m == 8 and 13 <= d <= 17: return 1
     return 0
 
 df["Festival_Release"] = df.apply(festival_flag, axis=1)
@@ -283,13 +380,11 @@ df["Genre_Label"]    = label_genre.fit_transform(df["Genre"].astype(str))
 print(f"  Languages     : {list(label_language.classes_)}")
 print(f"  Genres        : {list(label_genre.classes_)}")
 print(f"  Festival rows : {df['Festival_Release'].sum()}")
-print(f"\n  Verdict distribution:")
+print(f"\n  Verdict distribution (raw):")
 print(df["Verdict_Clean"].value_counts().to_string())
 
 # ── Merge dynamic features if available ───────────────────────
 DYNAMIC_PATH = "data/dynamic_features.csv"
-HAS_DYNAMIC  = False
-
 if os.path.exists(DYNAMIC_PATH):
     print(f"\n  ✓ Found {DYNAMIC_PATH} — merging YouTube + Trends features...")
     dyn = pd.read_csv(DYNAMIC_PATH)
@@ -299,27 +394,17 @@ if os.path.exists(DYNAMIC_PATH):
     df["Trailer_Views_M"]   = df["Trailer_Views_M"].fillna(df["Trailer_Views_M"].median())
     df["Trends_Score"]      = df["Trends_Score"].fillna(50)
     df["Trailer_Views_Log"] = df["Trailer_Views_Log"].fillna(df["Trailer_Views_Log"].median())
-    HAS_DYNAMIC = True
-    matched = df["Trailer_Views_M"].notna().sum()
-    print(f"  Dynamic features merged: {matched}/{len(df)} movies matched")
-
 
 # ── Train/Test Split ──────────────────────────────────────────
 print("\n[4/10] Splitting data...")
 
-# Full feature set (with new quick-win features)
 FEATURES = [
     "Budget", "Opening_Day", "Screens",
     "Language_Label", "Season_Label", "Franchise",
     "Opening_to_Budget", "Screens_to_Budget", "Opening_per_Screen",
     "Release_Year", "Genre_Label",
-    # ── QUICK WIN ────────────────────────────
-    "Rating",            # audience/critic score
-    "Log_Budget",        # non-linear budget scale
-    "Budget_Squared",    # blockbuster scale
-    "Overseas_Ratio",    # pan-India vs regional
-    "Rating_x_Budget",   # quality × scale interaction
-    "Festival_Release",  # Eid/Diwali/Christmas
+    "Rating", "Log_Budget", "Budget_Squared",
+    "Overseas_Ratio", "Rating_x_Budget", "Festival_Release",
 ]
 
 X     = df[FEATURES]
@@ -330,7 +415,6 @@ train_idx, test_idx   = X_train.index, X_test.index
 train_df = df.loc[train_idx].copy()
 test_df  = df.loc[test_idx].copy()
 
-# Star / Director power (train only — no leakage)
 star_power_map     = train_df.groupby("Star_Featuring")["Worldwide"].median()
 director_power_map = train_df.groupby("Director")["Worldwide"].mean()
 global_star_mean     = float(star_power_map.mean())
@@ -351,26 +435,44 @@ df["Verdict_Label"] = label_encoder.fit_transform(df["Verdict_Clean"])
 Y_clf_train = df.loc[X_train_full.index, "Verdict_Label"]
 Y_clf_test  = df.loc[X_test_full.index,  "Verdict_Label"]
 
-counts  = Counter(Y_clf_train.tolist())
-n_total, n_cls = len(Y_clf_train), len(counts)
-sw      = {cls: n_total/(n_cls*cnt) for cls,cnt in counts.items()}
-sample_weights = np.array([sw[y] for y in Y_clf_train])
+# ── SMOTE Balancing ───────────────────────────────────────────
+# NOTE: SMOTE is applied ONLY to classifier training data
+#       Test data is NEVER resampled (avoids data leakage)
+print("\n[4b/10] Applying SMOTE to balance classifier training data...")
+
+X_train_smote, Y_clf_train_smote, smote_report = apply_smote(
+    X_train_full.values, Y_clf_train.values,
+    strategy="auto",   # upsample all minority classes to match majority
+    random_state=42
+)
+print_smote_report(smote_report, label_encoder)
+
+# Convert back to DataFrame for consistency
+X_train_smote_df = pd.DataFrame(X_train_smote, columns=FEATURES_FULL)
+
+# Recalculate sample weights on SMOTE-balanced data (still useful for some algos)
+counts_sm  = Counter(Y_clf_train_smote.tolist())
+n_total_sm = len(Y_clf_train_smote)
+n_cls_sm   = len(counts_sm)
+sw_sm      = {cls: n_total_sm/(n_cls_sm*cnt) for cls,cnt in counts_sm.items()}
+sample_weights_smote = np.array([sw_sm[y] for y in Y_clf_train_smote])
 
 scaler   = StandardScaler()
-X_tr_sc  = scaler.fit_transform(X_train_full)
+X_tr_sc  = scaler.fit_transform(X_train_full)      # scaled original (for regressors)
 X_te_sc  = scaler.transform(X_test_full)
 
-print(f"  Train: {len(X_train_full)} | Test: {len(X_test_full)}")
-print(f"  Features: {len(FEATURES_FULL)} total (was 12, now {len(FEATURES_FULL)})")
+scaler_sm   = StandardScaler()
+X_tr_sm_sc  = scaler_sm.fit_transform(X_train_smote_df)  # scaled SMOTE (for linear classifiers)
+
+print(f"\n  Train: {len(X_train_full)} (original) → "
+      f"{len(X_train_smote_df)} (after SMOTE) | Test: {len(X_test_full)}")
+print(f"  Features: {len(FEATURES_FULL)}")
 
 # ================================================================
 #  STEP 5 — TWO-STAGE PREDICTION
-#  Stage 1: predict Log_Opening_Week from pre-release features
-#  Stage 2: use predicted opening + all features → predict lifetime
 # ================================================================
 print("\n[5/10] Training two-stage predictor...")
 
-# Stage-1 features — only things known BEFORE release
 STAGE1_FEATURES = [
     "Budget", "Screens", "Language_Label", "Season_Label",
     "Franchise", "Screens_to_Budget", "Release_Year",
@@ -378,10 +480,8 @@ STAGE1_FEATURES = [
     "Rating", "Festival_Release", "Star_Power", "Director_Power",
 ]
 
-# Target: log opening week (approx 3× opening day)
 df["Opening_Week"]     = df["Opening_Day"] * 3.2
 df["Log_Opening_Week"] = np.log1p(df["Opening_Week"])
-
 train_df["Opening_Week"]     = train_df["Opening_Day"] * 3.2
 train_df["Log_Opening_Week"] = np.log1p(train_df["Opening_Week"])
 test_df["Opening_Week"]      = test_df["Opening_Day"] * 3.2
@@ -396,33 +496,51 @@ stage1_model = XGBRegressor(
 )
 stage1_model.fit(train_df[STAGE1_FEATURES], Y_s1_train)
 
-# Predict opening week → add as feature for stage 2
 train_df["Pred_Opening_Week"] = np.expm1(stage1_model.predict(train_df[STAGE1_FEATURES]))
 test_df["Pred_Opening_Week"]  = np.expm1(stage1_model.predict(test_df[STAGE1_FEATURES]))
 
-# Stage-2 features = all + predicted opening week
 FEATURES_S2 = FEATURES_FULL + ["Pred_Opening_Week", "Log_Opening_Week"]
 
-# For test we use pred opening (simulating real prediction scenario)
 X_train_s2 = train_df[FEATURES_S2]
 X_test_s2  = test_df[FEATURES_S2]
 
-# Quick check
 s1_r2 = r2_score(Y_s1_test, stage1_model.predict(test_df[STAGE1_FEATURES]))
 print(f"  Stage-1 R² (opening week) : {s1_r2:.4f}")
 
+# ── Extend SMOTE-balanced data with Stage-2 features ─────────
+# We add Pred_Opening_Week and Log_Opening_Week to SMOTE train set.
+# These are computed from Stage-1 predictions on original train data,
+# then the SMOTE synthetic samples inherit interpolated values.
+train_df_s2_vals = train_df[FEATURES_S2].values
+X_train_s2_smote, Y_clf_s2_smote, smote_report_s2 = apply_smote(
+    train_df_s2_vals, Y_clf_train.values,
+    strategy="auto", random_state=42
+)
+X_train_s2_smote_df = pd.DataFrame(X_train_s2_smote, columns=FEATURES_S2)
+
+print(f"\n  Stage-2 SMOTE: {len(X_train_s2)} → {len(X_train_s2_smote_df)} samples")
+
+# Scalers for linear models (using s2 + SMOTE)
+scaler_s2     = StandardScaler()
+X_tr_s2_sc    = scaler_s2.fit_transform(X_train_s2)          # original (for regressors)
+X_te_s2_sc    = scaler_s2.transform(X_test_s2)
+
+scaler_s2_sm  = StandardScaler()
+X_tr_s2_sm_sc = scaler_s2_sm.fit_transform(X_train_s2_smote_df)  # SMOTE (for linear clfs)
+
+# Sample weights on s2-SMOTE data
+counts_s2  = Counter(Y_clf_s2_smote.tolist())
+sw_s2      = {cls: len(Y_clf_s2_smote)/(len(counts_s2)*cnt) for cls,cnt in counts_s2.items()}
+sample_weights_s2 = np.array([sw_s2[y] for y in Y_clf_s2_smote])
+
 # ================================================================
-#  STEP 6 — BENCHMARK 12 ALGORITHMS (on Stage-2 features)
+#  STEP 6 — BENCHMARK 12 ALGORITHMS
 # ================================================================
 print("\n[6/10] Benchmarking 12 algorithms...")
 print("  (takes ~4-8 minutes)\n")
 
 LINEAR_REGS = {"Ridge","Lasso","ElasticNet","BayesianRidge","KNN","SVR"}
 LINEAR_CLFS = {"LogisticRegression","KNN","SVM","NaiveBayes"}
-
-scaler_s2   = StandardScaler()
-X_tr_s2_sc  = scaler_s2.fit_transform(X_train_s2)
-X_te_s2_sc  = scaler_s2.transform(X_test_s2)
 
 REGRESSORS = {
     "XGBoost":          XGBRegressor(n_estimators=600,learning_rate=0.05,max_depth=6,
@@ -454,6 +572,7 @@ print("  " + "-"*55)
 
 for name, model in REGRESSORS.items():
     try:
+        # Regressors use ORIGINAL (unbalanced) training data — correct for regression
         Xtr = X_tr_s2_sc if name in LINEAR_REGS else X_train_s2.values
         Xte = X_te_s2_sc if name in LINEAR_REGS else X_test_s2.values
         model.fit(Xtr, Y_train_reg)
@@ -472,6 +591,7 @@ for name, model in REGRESSORS.items():
         print(f"  {name:<22} ERROR: {e}")
         reg_scores[name] = {"r2":0,"mae_cr":9999,"cv_r2":0,"model":model}
 
+# ── Classifiers — use SMOTE-balanced data ────────────────────
 CLASSIFIERS = {
     "XGBoost":            XGBClassifier(n_estimators=600,learning_rate=0.05,max_depth=6,
                               subsample=0.8,colsample_bytree=0.8,
@@ -502,21 +622,24 @@ clf_scores = {}
 NEEDS_SW   = {"XGBoost","GradientBoosting","AdaBoost","RandomForest",
               "ExtraTrees","LightGBM","CatBoost","DecisionTree"}
 
-print(f"\n  {'Algorithm':<22} {'Test Acc':>10}  {'CV Acc':>8}")
+print(f"\n  Classifiers use SMOTE-balanced training data ({len(X_train_s2_smote_df)} samples)")
+print(f"  {'Algorithm':<22} {'Test Acc':>10}  {'CV Acc':>8}")
 print("  " + "-"*44)
 
 for name, model in CLASSIFIERS.items():
     try:
-        Xtr = X_tr_s2_sc if name in LINEAR_CLFS else X_train_s2.values
-        Xte = X_te_s2_sc if name in LINEAR_CLFS else X_test_s2.values
-        fit_kw = {"sample_weight": sample_weights} if name in NEEDS_SW else {}
-        model.fit(Xtr, Y_clf_train, **fit_kw)
+        # SMOTE-balanced data for classifiers
+        Xtr = X_tr_s2_sm_sc if name in LINEAR_CLFS else X_train_s2_smote_df.values
+        # Test data stays original (no SMOTE on test set)
+        Xte = X_te_s2_sc    if name in LINEAR_CLFS else X_test_s2.values
+
+        fit_kw = {"sample_weight": sample_weights_s2} if name in NEEDS_SW else {}
+        model.fit(Xtr, Y_clf_s2_smote, **fit_kw)
         preds  = model.predict(Xte)
         acc    = accuracy_score(Y_clf_test, preds)
         n_cv   = 3 if name in {"SVM","KNN","AdaBoost"} else 5
         cv_acc = cross_val_score(model,
-                    X_tr_s2_sc if name in LINEAR_CLFS else X_train_s2.values,
-                    Y_clf_train,
+                    Xtr, Y_clf_s2_smote,
                     cv=StratifiedKFold(n_splits=n_cv,shuffle=True,random_state=42),
                     scoring="accuracy",n_jobs=-1).mean()
         clf_scores[name] = {"acc":acc,"cv_acc":cv_acc,"model":model}
@@ -541,23 +664,84 @@ print(f"  ★ Top 3 Classifiers : {[n for n,_ in top3_clf]}")
 reg_base = [(n.lower().replace(" ","_"), reg_scores[n]["model"]) for n,_ in top3_reg]
 clf_base = [(n.lower().replace(" ","_"), clf_scores[n]["model"]) for n,_ in top3_clf]
 
+# ─────────────────────────────────────────────
+#  IMPROVED STACKING (ALOHA UPGRADE)
+# ─────────────────────────────────────────────
+
+# Better meta learner for regression
 final_regressor = StackingRegressor(
-    estimators=reg_base, final_estimator=Ridge(alpha=1.0),
-   cv=5, n_jobs=-1, passthrough=True
-)
-final_classifier = StackingClassifier(
-    estimators=clf_base,
-    final_estimator=LogisticRegression(max_iter=2000,class_weight="balanced",C=1.0),
-    cv=5, n_jobs=-1, passthrough=False
+    estimators=reg_base,
+    final_estimator=ElasticNet(alpha=0.01, l1_ratio=0.7),
+    cv=5,
+    n_jobs=-1,
+    passthrough=True
 )
 
-print("  Training stacking regressor ...")
+# Better meta learner for classification
+meta_clf = LogisticRegression(
+    max_iter=3000,
+    class_weight="balanced",
+    C=2.0
+)
+
+final_classifier = StackingClassifier(
+    estimators=clf_base,
+    final_estimator=meta_clf,
+    cv=5,
+    n_jobs=-1,
+    passthrough=True
+)
+
+# Calibration (BIG BOOST)
+final_classifier = CalibratedClassifierCV(
+    final_classifier,
+    method='sigmoid',
+    cv=3
+)
+
+print("  Training stacking regressor (original data)...")
 final_regressor.fit(X_train_s2, Y_train_reg)
-print("  Training stacking classifier ...")
-final_classifier.fit(X_train_s2, Y_clf_train)
+
+print("  Training stacking classifier (SMOTE-balanced data)...")
+final_classifier.fit(X_train_s2_smote_df, Y_clf_s2_smote)
 
 Y_pred_reg = final_regressor.predict(X_test_s2)
 Y_pred_clf = final_classifier.predict(X_test_s2)
+
+# ─────────────────────────────────────────────
+#  ALOHA Weighted Ensemble (FINAL BOOST)
+# ─────────────────────────────────────────────
+
+print("\n[Extra] ALOHA Weighted Ensemble...")
+
+top_models = [clf_scores[n]["model"] for n, _ in top3_clf]
+
+preds = []
+weights = []
+
+for name, _ in top3_clf:
+    model = clf_scores[name]["model"]
+    pred = model.predict(X_test_s2)
+    preds.append(pred)
+    weights.append(clf_scores[name]["cv_acc"])
+
+preds = np.array(preds)
+weights = np.array(weights)
+
+final_weighted = []
+
+for i in range(preds.shape[1]):
+    votes = {}
+    for j in range(len(preds)):
+        cls = preds[j][i]
+        votes[cls] = votes.get(cls, 0) + weights[j]
+    final_weighted.append(max(votes, key=votes.get))
+
+final_weighted = np.array(final_weighted)
+
+aloha_acc = accuracy_score(Y_clf_test, final_weighted)
+
+print(f"  ALOHA Ensemble Accuracy : {aloha_acc:.4f}")
 
 r2     = r2_score(Y_test_reg, Y_pred_reg)
 mae    = mean_absolute_error(Y_test_reg, Y_pred_reg)
@@ -585,7 +769,6 @@ print(f"  MAE (Crores)   : ₹{mae_cr:.1f} Cr")
 print(f"  CV R² (best)   : {cv_r2:.4f}")
 print(f"  Clf Accuracy   : {acc:.4f}")
 
-# Leaderboards
 print(f"\n  ── REGRESSOR LEADERBOARD ──")
 print(f"  {'Rank':<5}{'Algorithm':<22}{'R²':>8}  {'MAE Cr':>8}  {'CV R²':>8}")
 print("  " + "-"*56)
@@ -593,38 +776,23 @@ for i,(n,s) in enumerate(sorted(reg_scores.items(),key=lambda x:x[1]["cv_r2"],re
     print(f"  {i:<5}{n:<22}{s['r2']:>8.4f}  {s['mae_cr']:>8.1f}  {s['cv_r2']:>8.4f}"
           + (" ★" if i<=3 else ""))
 
-# ================================================================
-#  HYPERPARAMETER TUNING — CatBoost (best model)
-# ================================================================
-print("\n  Tuning CatBoost hyperparameters (RandomizedSearchCV)...")
-
-from sklearn.model_selection import RandomizedSearchCV
-from scipy.stats import randint, uniform
-
+# ── Hyperparameter Tuning ─────────────────────────────────────
+print("\n  Tuning CatBoost hyperparameters...")
 catboost_params = {
     "iterations":    randint(200, 600),
     "learning_rate": uniform(0.01, 0.09),
     "depth":         randint(4, 8),
 }
-
 cat_search = RandomizedSearchCV(
     CatBoostRegressor(random_seed=42, verbose=0),
     param_distributions=catboost_params,
-    n_iter=40,
-    cv=3,
-    scoring="r2",
-    random_state=42,
-    n_jobs=-1,
+    n_iter=40, cv=3, scoring="r2", random_state=42, n_jobs=-1,
 )
 cat_search.fit(X_train_s2, Y_train_reg)
-best_cat_params = cat_search.best_params_
-print(f"  ✓ Best CatBoost params: {best_cat_params}")
-print(f"  ✓ Best CV R²: {cat_search.best_score_:.4f}")
-
-# Replace CatBoost in REGRESSORS with tuned version
+print(f"  ✓ Best CatBoost params: {cat_search.best_params_}")
 REGRESSORS["CatBoost"] = cat_search.best_estimator_
 reg_scores["CatBoost"]["model"] = cat_search.best_estimator_
-# Tune XGBoost too
+
 print("\n  Tuning XGBoost hyperparameters...")
 xgb_params = {
     "n_estimators":     randint(400, 800),
@@ -636,12 +804,10 @@ xgb_params = {
 xgb_search = RandomizedSearchCV(
     XGBRegressor(random_state=42, verbosity=0),
     param_distributions=xgb_params,
-    n_iter=20, cv=3, scoring="r2",
-    random_state=42, n_jobs=-1,
+    n_iter=20, cv=3, scoring="r2", random_state=42, n_jobs=-1,
 )
 xgb_search.fit(X_train_s2, Y_train_reg)
 print(f"  ✓ Best XGBoost params : {xgb_search.best_params_}")
-print(f"  ✓ Best XGBoost CV R²  : {xgb_search.best_score_:.4f}")
 REGRESSORS["XGBoost"] = xgb_search.best_estimator_
 reg_scores["XGBoost"]["model"] = xgb_search.best_estimator_
 
@@ -655,22 +821,22 @@ for i,(n,s) in enumerate(sorted(clf_scores.items(),key=lambda x:x[1]["cv_acc"],r
 # ================================================================
 #  STEP 8 — CONFIDENCE INTERVALS (Quantile Regression)
 # ================================================================
-print("\n[8/10] Training confidence interval models (quantile regression)...")
+print("\n[8/10] Training confidence interval models...")
 
 lower_model = GradientBoostingRegressor(
-    loss="quantile", alpha=0.10,   # 10th percentile → lower bound
+    loss="quantile", alpha=0.10,
     n_estimators=300, learning_rate=0.05, max_depth=5,
     subsample=0.8, random_state=42
 )
 upper_model = GradientBoostingRegressor(
-    loss="quantile", alpha=0.90,   # 90th percentile → upper bound
+    loss="quantile", alpha=0.90,
     n_estimators=300, learning_rate=0.05, max_depth=5,
     subsample=0.8, random_state=42
 )
+# Quantile regressors use original (unbalanced) training data
 lower_model.fit(X_train_s2, Y_train_reg)
 upper_model.fit(X_train_s2, Y_train_reg)
 
-# Evaluate coverage: what % of actuals fall inside predicted range?
 lower_preds = np.expm1(lower_model.predict(X_test_s2))
 upper_preds = np.expm1(upper_model.predict(X_test_s2))
 actual_cr   = np.expm1(Y_test_reg.values)
@@ -686,19 +852,20 @@ print(f"  ✓ Average width     : ₹{avg_width:.0f} Cr")
 print("\n[9/10] Saving models...")
 os.makedirs("models", exist_ok=True)
 
-joblib.dump(final_regressor,    "models/regressor.pkl")
-joblib.dump(final_classifier,   "models/classifier.pkl")
-joblib.dump(stage1_model,       "models/stage1_model.pkl")       # opening week predictor
-joblib.dump(lower_model,        "models/lower_bound.pkl")         # confidence lower
-joblib.dump(upper_model,        "models/upper_bound.pkl")         # confidence upper
-joblib.dump(label_encoder,      "models/label_encoder.pkl")
-joblib.dump(label_language,     "models/label_language.pkl")
-joblib.dump(label_season,       "models/label_season.pkl")
-joblib.dump(label_genre,        "models/label_genre.pkl")
-joblib.dump(star_power_map,     "models/star_power_map.pkl")
-joblib.dump(director_power_map, "models/director_power_map.pkl")
-joblib.dump(scaler,             "models/scaler.pkl")
-joblib.dump(scaler_s2,          "models/scaler_s2.pkl")
+joblib.dump(final_regressor,      "models/regressor.pkl")
+joblib.dump(final_classifier,     "models/classifier.pkl")
+joblib.dump(stage1_model,         "models/stage1_model.pkl")
+joblib.dump(lower_model,          "models/lower_bound.pkl")
+joblib.dump(upper_model,          "models/upper_bound.pkl")
+joblib.dump(label_encoder,        "models/label_encoder.pkl")
+joblib.dump(label_language,       "models/label_language.pkl")
+joblib.dump(label_season,         "models/label_season.pkl")
+joblib.dump(label_genre,          "models/label_genre.pkl")
+joblib.dump(star_power_map,       "models/star_power_map.pkl")
+joblib.dump(director_power_map,   "models/director_power_map.pkl")
+joblib.dump(scaler,               "models/scaler.pkl")
+joblib.dump(scaler_s2,            "models/scaler_s2.pkl")
+joblib.dump(smote_report_s2,      "models/smote_report.pkl")   # ← NEW: saved for inspection
 joblib.dump({
     "global_star_mean":     global_star_mean,
     "global_director_mean": global_director_mean,
@@ -710,22 +877,26 @@ joblib.dump({
     "reg_r2": r2, "reg_mae_cr": mae_cr, "clf_accuracy": acc,
     "interval_coverage": coverage, "interval_avg_width": avg_width,
     "rating_median": rating_median,
+    "smote_method":   smote_report_s2["method"],
+    "smote_added":    smote_report_s2["added"],
+    "smote_before":   smote_report_s2["before"],
+    "smote_after":    smote_report_s2["after"],
     "reg_scores": {k:{"r2":v["r2"],"mae_cr":v["mae_cr"],"cv_r2":v["cv_r2"]}
                    for k,v in reg_scores.items()},
     "clf_scores": {k:{"acc":v["acc"],"cv_acc":v["cv_acc"]}
                    for k,v in clf_scores.items()},
 }, "models/meta.pkl")
 
-print("  ✓ All models saved")
+print("  ✓ All models saved (incl. smote_report.pkl)")
 log_run({
-    "n_movies":df.shape[0],"reg_r2":r2,"reg_mae_cr":mae_cr,"reg_cv_r2":cv_r2,
-    "clf_accuracy":acc,"best_reg_algo":top3_reg[0][0],"best_clf_algo":top3_clf[0][0],
-    "ensemble_type":f"TwoStage+Stack({','.join(n for n,_ in top3_reg)})→Ridge",
-    "algo_scores":{
-        "reg":{k:{"r2":v["r2"],"mae_cr":v["mae_cr"],"cv_r2":v["cv_r2"]}
-               for k,v in reg_scores.items()},
-        "clf":{k:{"acc":v["acc"],"cv_acc":v["cv_acc"]}
-               for k,v in clf_scores.items()},
+    "n_movies": df.shape[0], "reg_r2": r2, "reg_mae_cr": mae_cr, "reg_cv_r2": cv_r2,
+    "clf_accuracy": acc, "best_reg_algo": top3_reg[0][0], "best_clf_algo": top3_clf[0][0],
+    "ensemble_type": f"TwoStage+SMOTE+Stack({','.join(n for n,_ in top3_reg)})→Ridge",
+    "algo_scores": {
+        "reg": {k:{"r2":v["r2"],"mae_cr":v["mae_cr"],"cv_r2":v["cv_r2"]}
+                for k,v in reg_scores.items()},
+        "clf": {k:{"acc":v["acc"],"cv_acc":v["cv_acc"]}
+                for k,v in clf_scores.items()},
     }
 })
 print("  ✓ Training run logged to database")
@@ -737,13 +908,13 @@ print("\n[10/10] Generating charts...")
 
 predicted_cr = np.expm1(Y_pred_reg)
 
-fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-fig.suptitle("Indian Box Office Predictor v4 — Two-Stage + Confidence Intervals",
+fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+fig.suptitle("Indian Box Office Predictor v5 — Two-Stage + SMOTE + Confidence Intervals",
              fontsize=14, fontweight="bold")
 
 # Chart 1 — Actual vs Predicted with confidence interval
 ax = axes[0,0]
-sorted_idx   = np.argsort(actual_cr)
+sorted_idx = np.argsort(actual_cr)
 ax.fill_between(range(len(sorted_idx)),
                 lower_preds[sorted_idx], upper_preds[sorted_idx],
                 alpha=0.25, color="#7F77DD", label="70% confidence interval")
@@ -752,7 +923,7 @@ ax.scatter(range(len(sorted_idx)), actual_cr[sorted_idx],
 ax.scatter(range(len(sorted_idx)), predicted_cr[sorted_idx],
            s=20, color="#7F77DD", alpha=0.7, label="Predicted")
 ax.set_xlabel("Movies (sorted by actual)"); ax.set_ylabel("Collection (Cr)")
-ax.set_title(f"Actual vs Predicted with Confidence Band\nR² = {r2:.3f}  |  Coverage = {coverage*100:.0f}%")
+ax.set_title(f"Actual vs Predicted\nR² = {r2:.3f}  |  Coverage = {coverage*100:.0f}%")
 ax.legend(fontsize=8)
 
 # Chart 2 — Regressor leaderboard
@@ -766,17 +937,17 @@ ax.set_xlabel("CV R²"); ax.set_title("Regressor Leaderboard\nPurple = in ensemb
 ax.legend(fontsize=8)
 
 # Chart 3 — Classifier leaderboard
-ax = axes[1,0]
+ax = axes[0,2]
 cnames = [n for n,_ in sorted(clf_scores.items(),key=lambda x:x[1]["cv_acc"],reverse=True)]
 cvals  = [clf_scores[n]["cv_acc"] for n in cnames]
 ccols  = ["#7F77DD" if n in [x for x,_ in top3_clf] else "#B4B2A9" for n in cnames]
 ax.barh(cnames, cvals, color=ccols)
 ax.axvline(acc, color="red", linestyle="--", lw=1.2, label=f"Ensemble={acc:.3f}")
-ax.set_xlabel("CV Accuracy"); ax.set_title("Classifier Leaderboard\nPurple = in ensemble")
+ax.set_xlabel("CV Accuracy"); ax.set_title("Classifier Leaderboard (SMOTE-trained)\nPurple = in ensemble")
 ax.legend(fontsize=8)
 
 # Chart 4 — Confusion matrix
-ax = axes[1,1]
+ax = axes[1,0]
 cm = confusion_matrix(Y_clf_test, Y_pred_clf)
 sns.heatmap(cm, annot=True, fmt="d", ax=ax,
             xticklabels=label_encoder.classes_,
@@ -785,10 +956,77 @@ ax.set_title(f"Confusion Matrix\nAccuracy = {acc:.3f}")
 ax.set_xlabel("Predicted"); ax.set_ylabel("Actual")
 plt.setp(ax.get_xticklabels(), rotation=35, ha="right", fontsize=7)
 
+# Chart 5 — SMOTE Before vs After class distribution
+ax = axes[1,1]
+classes    = [label_encoder.inverse_transform([c])[0]
+              for c in sorted(smote_report_s2["before"].keys())]
+before_cnt = [smote_report_s2["before"].get(c, 0)
+              for c in sorted(smote_report_s2["before"].keys())]
+after_cnt  = [smote_report_s2["after"].get(c, 0)
+              for c in sorted(smote_report_s2["after"].keys())]
+x = np.arange(len(classes)); w = 0.35
+bars1 = ax.bar(x - w/2, before_cnt, w, label="Before SMOTE", color="#D85A30", alpha=0.8)
+bars2 = ax.bar(x + w/2, after_cnt,  w, label="After SMOTE",  color="#7F77DD", alpha=0.8)
+ax.set_xticks(x); ax.set_xticklabels(classes, rotation=25, ha="right", fontsize=8)
+ax.set_ylabel("Sample Count")
+ax.set_title(f"SMOTE Class Balancing\n({smote_report_s2['method']}  +{smote_report_s2['added']} samples)")
+ax.legend(fontsize=8)
+for bar in bars1: ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.5,
+                           str(int(bar.get_height())), ha='center', va='bottom', fontsize=7)
+for bar in bars2: ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.5,
+                           str(int(bar.get_height())), ha='center', va='bottom', fontsize=7)
+
+# Chart 6 — Residuals
+ax = axes[1,2]
+residuals = actual_cr - predicted_cr
+ax.scatter(predicted_cr, residuals, alpha=0.5, s=15, color="#7F77DD")
+ax.axhline(0, color="red", linestyle="--", lw=1.2)
+ax.set_xlabel("Predicted (Cr)"); ax.set_ylabel("Residual (Cr)")
+ax.set_title("Residual Plot\n(Actual − Predicted)")
+
 fig.tight_layout()
 fig.savefig("models/results.png", dpi=150, bbox_inches="tight")
 plt.show()
-print("  ✓ Chart saved → models/results.png")
+print("  ✓ Chart saved → models/results.png  (6-panel, incl. SMOTE chart)")
+
+# ── EXTRA: Standalone Classifier Leaderboard (separate PNG) ──
+fig2, ax2 = plt.subplots(figsize=(7, 6))
+
+cnames_sorted = [n for n, _ in sorted(clf_scores.items(),
+                  key=lambda x: x[1]["acc"], reverse=False)]  # ascending for barh
+cvals_sorted  = [clf_scores[n]["acc"] for n in cnames_sorted]
+ccols_sorted  = ["#7F77DD" if n in [x for x, _ in top3_clf]
+                 else "#B4B2A9" for n in cnames_sorted]
+
+bars = ax2.barh(cnames_sorted, cvals_sorted,
+                color=ccols_sorted, edgecolor="white", height=0.7)
+
+# Ensemble line — uses ALOHA accuracy
+ax2.axvline(x=aloha_acc, color="red", linestyle="--", linewidth=1.5,
+            label=f"Ensemble={aloha_acc:.3f}")
+
+# Value labels on bars
+for bar, val in zip(bars, cvals_sorted):
+    ax2.text(bar.get_width() + 0.003,
+             bar.get_y() + bar.get_height() / 2,
+             f"{val:.3f}", va="center", ha="left",
+             fontsize=8, color="#333333")
+
+ax2.set_xlabel("CV Accuracy", fontsize=10)
+ax2.set_xlim(0, max(cvals_sorted) + 0.12)
+ax2.set_title("Classifier Leaderboard\nPurple = in ensemble",
+              fontsize=11, fontweight="bold")
+ax2.legend(loc="lower right", fontsize=9)
+ax2.spines["top"].set_visible(False)
+ax2.spines["right"].set_visible(False)
+ax2.tick_params(axis="y", labelsize=9)
+ax2.tick_params(axis="x", labelsize=9)
+
+fig2.tight_layout()
+fig2.savefig("models/classifier_leaderboard.png", dpi=150,
+             bbox_inches="tight", facecolor="white")
+plt.show()
+print("  ✓ Classifier leaderboard saved → models/classifier_leaderboard.png")
 
 # ================================================================
 #  TERMINAL PREDICTION
@@ -827,7 +1065,6 @@ try:
     log_bud    = np.log1p(budget)
     bud_sq     = budget ** 2
 
-    # Stage 1 — predict opening week
     s1_row = pd.DataFrame([{
         "Budget":budget,"Screens":screens,"Language_Label":lang_val,"Season_Label":season_val,
         "Franchise":int(is_franchise),"Screens_to_Budget":screens/budget,"Release_Year":release_year,
@@ -836,7 +1073,6 @@ try:
     }])
     pred_opening_wk = round(float(np.expm1(stage1_model.predict(s1_row)[0])), 1)
 
-    # Stage 2 — predict lifetime
     s2_row = pd.DataFrame([{
         "Budget":budget,"Opening_Day":opening_day,"Screens":screens,
         "Language_Label":lang_val,"Season_Label":season_val,"Franchise":int(is_franchise),
@@ -863,7 +1099,7 @@ try:
     confidence    = "HIGH (both agree)" if agree else f"MEDIUM (classifier: {clf_verdict})"
 
     print("\n" + "="*65)
-    print("  FINAL PREDICTION (v4 — Two-Stage + Confidence Interval)")
+    print("  FINAL PREDICTION (v5 — Two-Stage + SMOTE + Confidence Interval)")
     print("="*65)
     print(f"  Movie              : {movie_name}")
     print(f"  Predicted Opening  : ₹{pred_opening_wk} Cr  (week 1)")
